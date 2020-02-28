@@ -7,30 +7,30 @@ local ngx          = ngx
 local dshm         = require "resty.dshm"
 
 local defaults = {
-    store      = var.session_dshm_store or "sessions",
-    host       = var.session_dshm_host or "127.0.0.1",
-    port       = tonumber(var.session_dshm_port) or 4321,
-    pool_size  = tonumber(var.session_dshm_pool_size) or 100,
-    pool_idle_timeout = tonumber(var.session_dshm_pool_idle_timeout) or 1000
+    store             = var.session_dshm_store                           or "sessions",
+    host              = var.session_dshm_host                            or "127.0.0.1",
+    port              = tonumber(var.session_dshm_port,              10) or 4321,
+    pool_size         = tonumber(var.session_dshm_pool_size,         10) or 100,
+    pool_idle_timeout = tonumber(var.session_dshm_pool_idle_timeout, 10) or 1000
 }
 
 local shm = {}
 
 shm.__index = shm
 
-function shm.new(config)
-    local c = config.shm or defaults
-    local m = c.store or defaults.store
+function shm.new(session)
+    local config = session.shm or defaults
+    local store = config.store or defaults.store
 
     local self = {
-        store      = dshm:new(),
-        encode     = config.encoder.encode,
-        decode     = config.encoder.decode,
-        delimiter  = config.cookie.delimiter,
-        name       = m,
-        host       = defaults.host,
-        port       = defaults.port,
-        pool_size  = defaults.pool_size,
+        store             = dshm:new(),
+        cookie            = session.cookie,
+        encode            = session.encoder.encode,
+        decode            = session.encoder.decode,
+        name              = store,
+        host              = defaults.host,
+        port              = defaults.port,
+        pool_size         = defaults.pool_size,
         pool_idle_timeout = defaults.pool_idle_timeout
     }
     return setmetatable(self, shm)
@@ -40,7 +40,7 @@ function shm:connect()
     return self.store:connect(self.host, self.port)
 end
 
-function shm:setkeepalive()
+function shm:set_keepalive()
     return self.store:set_keepalive(self.pool_idle_timeout, self.pool_size)
 end
 
@@ -51,7 +51,7 @@ function shm:set(...)
     end
     local ok
     ok, err = self.store:set(...)
-    self:setkeepalive()
+    self:set_keepalive()
     if err then
         return nil, err
     end
@@ -65,7 +65,7 @@ function shm:get(...)
     end
     local ok
     ok, err = self.store:get(...)
-    self:setkeepalive()
+    self:set_keepalive()
     if err then
         return nil, err
     end
@@ -79,7 +79,7 @@ function shm:touch(...)
     end
     local ok
     ok, err = self.store:touch(...)
-    self:setkeepalive()
+    self:set_keepalive()
     if err then
         return nil, err
     end
@@ -93,7 +93,7 @@ function shm:delete(...)
     end
     local ok
     ok, err = self.store:delete(...)
-    self:setkeepalive()
+    self:set_keepalive()
     if err then
         return nil, err
     end
@@ -104,28 +104,10 @@ function shm:key(i)
     return self.encode(i)
 end
 
-function shm:cookie(c)
-    local r, d = {}, self.delimiter
-    local i, p, s, e = 1, 1, c:find(d, 1, true)
-    while s do
-        if i > 2 then
-            return nil
-        end
-        r[i] = c:sub(p, e - 1)
-        i, p = i + 1, e + 1
-        s, e = c:find(d, p, true)
-    end
-    if i ~= 3 then
-        return nil
-    end
-    r[3] = c:sub(p)
-    return r
-end
-
 function shm:open(cookie, lifetime)
-    local r = self:cookie(cookie)
-    if r and r[1] and r[2] and r[3] then
-        local i, e, h = self.decode(r[1]), tonumber(r[2]), self.decode(r[3])
+    local c = self.cookie:parse(cookie)
+    if c and c[1] and c[2] and c[3] then
+        local i, e, h = self.decode(c[1]), tonumber(c[2], 10), self.decode(c[3])
         local k = self:key(i)
         local d = self:get(concat({self.name , k}, ":"))
         if d then

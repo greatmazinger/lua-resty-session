@@ -1,12 +1,16 @@
 local require      = require
-local var          = ngx.var
-local header       = ngx.header
-local concat       = table.concat
+
+local random       = require "resty.random"
+local resp         = require "ngx.resp"
+
 local ngx          = ngx
+local var          = ngx.var
 local time         = ngx.time
 local http_time    = ngx.http_time
 local set_header   = ngx.req.set_header
 local clear_header = ngx.req.clear_header
+local add_header   = resp.add_header
+local concat       = table.concat
 local ceil         = math.ceil
 local max          = math.max
 local find         = string.find
@@ -17,14 +21,36 @@ local pcall        = pcall
 local tonumber     = tonumber
 local setmetatable = setmetatable
 local getmetatable = getmetatable
-local random       = require "resty.random".bytes
+local bytes        = random.bytes
+
+local COOKIE_PARTS = {
+    DEFAULT = {
+        n = 3,
+        "id",
+        "expires", -- may also contain: `expires:usebefore`
+        "hash"
+    },
+    cookie = {
+        n = 4,
+        "id",
+        "expires", -- may also contain: `expires:usebefore`
+        "data",
+        "hash",
+    },
+}
 
 -- convert option to boolean
 -- @param val input
 -- @return `true` on `true`, "1", "on" or "true", or `nil` on `nil`, or `false` otherwise
-local function enabled(val)
-    if val == nil then return nil end
-    return val == true or (val == "1" or val == "true" or val == "on")
+local function enabled(value)
+    if value == nil then
+        return nil
+    end
+
+    return value == true
+        or value == "1"
+        or value == "true"
+        or value == "on"
 end
 
 -- returns the input value, or the default if the input is nil
@@ -32,6 +58,7 @@ local function ifnil(value, default)
     if value == nil then
         return default
     end
+
     return enabled(value)
 end
 
@@ -41,76 +68,87 @@ end
 -- @param default (string) the default module name, if `package` doesn't exist
 -- @return the module table, and the name of the module loaded (either package, or default)
 local function prequire(prefix, package, default)
-    local o, p = pcall(require, prefix .. package)
-    if not o then
+    local ok, module = pcall(require, prefix .. package)
+    if not ok then
         return require(prefix .. default), default
     end
-    return p, package
+
+    return module, package
 end
 
 
 -- create and set a cookie-header.
--- @session_obj (table) the session object for which to create the cookie
+-- @session (table) the session object for which to create the cookie
 -- @value value (string) the string value to set (must be encoded already). Defaults to an empty string.
--- @value expires (boolean) if thruthy, the created cookie will delete the existing session-data.
+-- @value expires (boolean) if truthy, the created cookie will delete the existing session cookie.
 -- @return true
-local function setcookie(session_obj, value, expires)
-    if ngx.headers_sent then return nil, "Attempt to set session cookie after sending out response headers." end
-    value = value or ""
-    local cookie_obj = session_obj.cookie
-    local i = 3
-    local k = {}
-    local cookie_domain = cookie_obj.domain
-    local cookie_samesite = cookie_obj.samesite
+local function set_cookie(session, value, expires)
+    if ngx.headers_sent then
+        return nil, "attempt to set session cookie after sending out response headers"
+    end
 
-    -- build cookie parameters, elements 1+2 will be set later
+    value = value or ""
+    local cookie = session.cookie
+    local output = {}
+    local i = 3
+
+     -- build cookie parameters, elements 1+2 will be set later
     if expires then
         -- we're expiring/deleting the data, so set an expiry in the past
-        k[i] = "; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0"
+        output[i] = "; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0"
         i=i+1
-    elseif cookie_obj.persistent then
-        k[i]   = "; Expires="
-        k[i+1] = http_time(session_obj.expires)
-        k[i+2] = "; Max-Age="
-        k[i+3] = cookie_obj.lifetime
-        i=i+4
+    elseif cookie.persistent then
+        output[i]   = "; Expires="
+        output[i+1] = http_time(session.expires)
+        output[i+2] = "; Max-Age="
+        output[i+3] = cookie.lifetime
+        i = i + 4
     end
+
+    local cookie_domain = cookie.domain
     if cookie_domain and cookie_domain ~= "localhost" and cookie_domain ~= "" then
-        k[i]   = "; Domain="
-        k[i+1] = cookie_domain
-        i=i+2
+        output[i]   = "; Domain="
+        output[i+1] = cookie_domain
+        i = i + 2
     end
-    k[i]   = "; Path="
-    k[i+1] = cookie_obj.path or "/"
-    i=i+2
-    if cookie_samesite == "Lax" or cookie_samesite == "Strict" or cookie_samesite == "None" then
-        k[i] = "; SameSite="
-        k[i+1] = cookie_samesite
-        i=i+2
+
+    output[i]   = "; Path="
+    output[i+1] = cookie.path or "/"
+    i = i + 2
+
+    local cookie_samesite = cookie.samesite
+    if cookie_samesite == "Lax"
+    or cookie_samesite == "Strict"
+    or cookie_samesite == "None"
+    then
+        output[i] = "; SameSite="
+        output[i+1] = cookie_samesite
+        i = i + 2
     end
-    if cookie_obj.secure then
-        k[i] = "; Secure"
-        i=i+1
+
+    if cookie.secure then
+        output[i] = "; Secure"
+        i = i + 1
     end
-    if cookie_obj.httponly then
-        k[i] = "; HttpOnly"
+
+    if cookie.httponly then
+        output[i] = "; HttpOnly"
     end
 
     -- How many chunks do we need?
-    local l
-    if expires and cookie_obj.chunks then
+    local cookie_parts
+    if expires and cookie.chunks then
         -- expiring cookie, so deleting data. Do not measure data, but use
         -- existing chunk count to make sure we clear all of them
-        l = cookie_obj.chunks
+        cookie_parts = cookie.chunks or 1
     else
         -- calculate required chunks from data
-        l = max(ceil(#value / cookie_obj.maxsize), 1)
+        cookie_parts = max(ceil(#value / cookie.maxsize), 1)
     end
 
-    local cookie_header = header["Set-Cookie"]
-    for j=1, l do
+    for j=1, cookie_parts do
         -- create numbered chunk names if required
-        local chunk_name = { session_obj.name }
+        local chunk_name = { session.name }
         if j > 1 then
             chunk_name[2] = "_"
             chunk_name[3] = j
@@ -119,101 +157,104 @@ local function setcookie(session_obj, value, expires)
             chunk_name[2] = "="
         end
         chunk_name = concat(chunk_name)
-        k[1] = chunk_name
+        output[1] = chunk_name
 
         if expires then
             -- expiring cookie, so deleting data; clear it
-            k[2] = ""
+            output[2] = ""
         else
             -- grab the piece for the current chunk
-            local sp = j * cookie_obj.maxsize - (cookie_obj.maxsize - 1)
-            if j < l then
-                k[2] = sub(value, sp, sp + (cookie_obj.maxsize - 1)) .. "0"
+            local sp = j * cookie.maxsize - (cookie.maxsize - 1)
+            if j < cookie_parts then
+                output[2] = sub(value, sp, sp + (cookie.maxsize - 1)) .. "0"
             else
-                k[2] = sub(value, sp)
+                output[2] = sub(value, sp)
             end
         end
 
-        -- build header value and add it to the header table/string
-        -- replace existing chunk-name, or append
-        local y = concat(k)
-        local t = type(cookie_header)
-        if t == "table" then
-            local f = false
-            local z = #cookie_header
-            for a=1, z do
-                if find(cookie_header[a], chunk_name, 1, true) == 1 then
-                    cookie_header[a] = y
-                    f = true
-                    break
-                end
-            end
-            if not f then
-                cookie_header[z+1] = y
-            end
-        elseif t == "string" and find(cookie_header, chunk_name, 1, true) ~= 1  then
-            cookie_header = { cookie_header, y }
-        else
-            cookie_header = y
-        end
+        add_header("Set-Cookie", concat(output))
     end
-    header["Set-Cookie"] = cookie_header
+
     return true
 end
 
--- read the cookie for the session object.
--- @param session_obj (table) the session object for which to read the cookie
--- @param i (number) do not use! internal recursion variable
--- @return string with cookie data (and the property `session.cookie.chunks`
---         will be set to the actual number of chunks read)
-local function getcookie(session_obj, i)
-    local name = session_obj.name
-    local n = { "cookie_", name }
-    if i then
-        n[3] = "_"
-        n[4] = i
+-- sets the usebefore property.
+-- @param session (table) the session object
+-- @return true if the value was updated, false otherwise
+local function set_usebefore(session)
+    local cookie    = session.cookie
+    local usebefore = cookie.usebefore or 0
+
+    if cookie.idletime == 0 then
+        cookie.usebefore = session.expires
     else
-        i = 1
+        local new_value = time() + cookie.idletime
+        if new_value - usebefore > 0.1 then -- less than 0.1 sec is not a new one
+            cookie.usebefore = new_value
+        end
     end
-    session_obj.cookie.chunks = i
-    local chunk_data = var[concat(n)]
-    if not chunk_data then return nil end
-    local l = #chunk_data
-    if l <= session_obj.cookie.maxsize then return chunk_data end
-    return concat{ sub(chunk_data, 1, session_obj.cookie.maxsize), getcookie(session_obj, i + 1) or "" }
+
+    return cookie.usebefore ~= usebefore
 end
 
 
 -- save the session.
 -- This will write to storage, and set the cookie (if returned by storage).
+-- NOTE: will always RESET lifetime!
 -- @param session (table) the session object
--- @param close (boolean) wether or not to close the "storage state" (unlocking locks etc)
+-- @param close (boolean) whether or not to close the "storage state" (unlocking locks etc)
 -- @return true on success
 local function save(session, close)
     session.expires = time() + session.cookie.lifetime
+
+    set_usebefore(session)
+
     local cookie, err = session.strategy.save(session, close)
-    if cookie then
-        return setcookie(session, cookie)
+    if not cookie then
+        return nil, err
     end
-    return nil, err
+
+    return set_cookie(session, cookie)
+end
+
+-- touches the session. This will NOT write to storage, and set the cookie (if
+-- returned by storage).
+-- Updates the "usebefore" / "idletime" without changing expiry.
+-- @param session (table) the session object
+-- @param close (boolean) whether or not to close the "storage state" (unlocking locks etc)
+-- @return true on success
+local function touch(session, close)
+    if set_usebefore(session) then
+        -- usebefore was updated, so set cookie
+        local cookie, err = session.strategy.touch(session, close)
+        if cookie then
+            return set_cookie(session, cookie)
+        end
+        return nil, err
+    end
+    return true
 end
 
 -- regenerates the session. Generates a new session ID.
 -- @param session (table) the session object
--- @param flush (boolean) if thruthy the old session will be destroyed, and data deleted
+-- @param flush (boolean) if truthy the old session will be destroyed, and data deleted
 -- @return nothing
 local function regenerate(session, flush)
-    local old_id = session.present and session.id
-    session.id = session:identifier()
-    if flush then
-        if old_id and session.storage.destroy then
-            session.storage:destroy(old_id)
+    local session_id = session.present and session.id
+    if session_id then
+        if flush and session.storage.destroy then
+            session.storage:destroy(session_id)
+            session.data = {}
+        elseif session.storage.close then
+            session.storage:close(session_id)
         end
-        session.data = {}
     end
+
+    session.id = session:identifier()
 end
 
-local secret = random(32, true) or random(32)
+
+local secret = bytes(32, true) or bytes(32)
 local defaults
 
 local function init()
@@ -227,32 +268,132 @@ local function init()
         cipher     = var.session_cipher     or "aes",
         hmac       = var.session_hmac       or "sha1",
         cookie = {
-            persistent = enabled(var.session_cookie_persistent or false),
-            discard    = tonumber(var.session_cookie_discard)  or 10,
-            renew      = tonumber(var.session_cookie_renew)    or 600,
-            lifetime   = tonumber(var.session_cookie_lifetime) or 3600,
-            path       = var.session_cookie_path               or "/",
+            persistent = enabled(var.session_cookie_persistent     or false),
+            discard    = tonumber(var.session_cookie_discard,  10) or 10,
+            renew      = tonumber(var.session_cookie_renew,    10) or 600,
+            lifetime   = tonumber(var.session_cookie_lifetime, 10) or 3600,
+            idletime   = tonumber(var.session_cookie_idletime, 10) or 0,
+            path       = var.session_cookie_path                   or "/",
             domain     = var.session_cookie_domain,
-            samesite   = var.session_cookie_samesite           or "Lax",
+            samesite   = var.session_cookie_samesite               or "Lax",
             secure     = enabled(var.session_cookie_secure),
-            httponly   = enabled(var.session_cookie_httponly   or true),
-            delimiter  = var.session_cookie_delimiter          or "|",
-            maxsize    = var.session_cookie_maxsize            or 4000
+            httponly   = enabled(var.session_cookie_httponly       or true),
+            delimiter  = var.session_cookie_delimiter              or "|",
+            maxsize    = var.session_cookie_maxsize                or 4000
         }, check = {
-            ssi    = enabled(var.session_check_ssi    or false),
-            ua     = enabled(var.session_check_ua     or true),
-            scheme = enabled(var.session_check_scheme or true),
-            addr   = enabled(var.session_check_addr   or false)
+            ssi    = enabled(var.session_check_ssi                 or false),
+            ua     = enabled(var.session_check_ua                  or true),
+            scheme = enabled(var.session_check_scheme              or true),
+            addr   = enabled(var.session_check_addr                or false)
         }
     }
     defaults.secret = var.session_secret or secret
 end
 
 local session = {
-    _VERSION = "2.26"
+    _VERSION = "3.0"
 }
 
 session.__index = session
+
+-- read the cookie for the session object.
+-- @param session (table) the session object for which to read the cookie
+-- @param i (number) do not use! internal recursion variable
+-- @return string with cookie data (and the property `session.cookie.chunks`
+--         will be set to the actual number of chunks read)
+function session:get_cookie(i)
+    local cookie_name = { "cookie_", self.name }
+    if i then
+        cookie_name[3] = "_"
+        cookie_name[4] = i
+    else
+        i = 1
+    end
+
+    self.cookie.chunks = i
+
+    local cookie = var[concat(cookie_name)]
+    if not cookie then
+        return nil
+    end
+
+    local cookie_size = #cookie
+    if cookie_size <= self.cookie.maxsize then
+        return cookie
+    end
+
+    return concat{ sub(cookie, 1, self.cookie.maxsize), self:get_cookie(i + 1) or "" }
+end
+
+-- Extracts the elements from the cookie-string (string-split essentially).
+-- @param value (string) the string to split in the elements
+-- @return array with the elements in order or nil if expected_count does not match to split count
+function session:parse_cookie(value)
+    local cookie
+    local parts = COOKIE_PARTS[self.storage] or COOKIE_PARTS.DEFAULT
+
+    local count = 1
+    local pos   = 1
+
+    local match_start, match_end = find(value, self.delimiter, 1, true)
+    while match_start do
+        if count > (parts.n - 1) then
+            return nil, "invalid cookie" -- too many elements
+        end
+        if not cookie then
+            cookie = {}
+        end
+
+        if count == 2 then
+            local cookie_part = sub(value, pos, match_end - 1)
+            local colon_pos = find(cookie_part, ":", 2, true)
+            if colon_pos then
+                cookie.expires = tonumber(sub(cookie_part, pos, colon_pos - 1), 10)
+                if not cookie.expires then
+                    return nil, "invalid cookie"
+                end
+
+                if self.idletime > 0 then
+                    cookie.usebefore = tonumber(sub(cookie_part, pos, colon_pos + 1), 10)
+                end
+            else
+                cookie.expires = tonumber(cookie_part, 10)
+                if not cookie.expires then
+                    return nil, "invalid cookie"
+                end
+            end
+        else
+            local cookie_part = self.encoder.decode(sub(value, pos, match_end - 1))
+            if not cookie_part then
+                return nil, "invalid cookie"
+            end
+
+            cookie[parts[count]] = cookie_part
+        end
+
+        count = count + 1
+        pos   = match_end + 1
+
+        match_start, match_end = find(value, self.delimiter, pos, true)
+    end
+
+    if count ~= parts.n then
+        return nil, "invalid cookie"
+    end
+
+    local cookie_part = self.encoder.decode(sub(value, pos))
+    if not cookie_part then
+        return nil, "invalid cookie"
+    end
+
+    cookie[parts[count]] = cookie_part
+
+    if cookie.id and cookie.expires and cookie.expires > time() and cookie.hash then
+        return cookie
+    end
+
+    return nil, "invalid cookie"
+end
 
 
 -- Constructor: creates a new session
@@ -261,63 +402,71 @@ function session.new(opts)
     if getmetatable(opts) == session then
         return opts
     end
+
     if not defaults then
         init()
     end
+
     opts = type(opts) == "table" and opts or defaults
-    local cookie_opts, cookie_defaults = opts.cookie or defaults.cookie, defaults.cookie
-    local check_opts,  check_defaults = opts.check  or defaults.check,  defaults.check
-    local ident_mod,  ident_name  = prequire("resty.session.identifiers.",
-                                             opts.identifier or defaults.identifier, "random")
-    local serial_mod, serial_name = prequire("resty.session.serializers.",
-                                             opts.serializer or defaults.serializer, "json")
-    local enc_mod,    enc_name    = prequire("resty.session.encoders.",
-                                             opts.encoder or defaults.encoder, "base64")
-    local ciph_mod,   ciph_name   = prequire("resty.session.ciphers.",
-                                             opts.cipher or defaults.cipher, "aes")
-    local stor_mod,   stor_name   = prequire("resty.session.storage.",
-                                             opts.storage or defaults.storage, "cookie")
-    local strat_mod,  strat_name  = prequire("resty.session.strategies.",
-                                             opts.strategy or defaults.strategy, "default")
-    local hmac_mod,   hmac_name   = prequire("resty.session.hmac.",
-                                             opts.hmac or defaults.hmac, "sha1")
+
+    local cookie = opts.cookie or defaults.cookie
+    local check   = opts.check or defaults.check
+
+    local ide, iden = prequire("resty.session.identifiers.", opts.identifier or defaults.identifier, "random")
+    local ser, sern = prequire("resty.session.serializers.", opts.serializer or defaults.serializer, "json")
+    local enc, encn = prequire("resty.session.encoders.",    opts.encoder    or defaults.encoder,    "base64")
+    local cip, cipn = prequire("resty.session.ciphers.",     opts.cipher     or defaults.cipher,     "aes")
+    local sto, ston = prequire("resty.session.storage.",     opts.storage    or defaults.storage,    "cookie")
+    local str, strn = prequire("resty.session.strategies.",  opts.strategy   or defaults.strategy,   "default")
+    local hma, hman = prequire("resty.session.hmac.",        opts.hmac       or defaults.hmac,       "sha1")
+
     local self = {
         name       = opts.name   or defaults.name,
-        identifier = ident_mod,
-        serializer = serial_mod,
-        strategy   = strat_mod,
-        encoder    = enc_mod,
-        hmac       = hmac_mod,
+        identifier = ide,
+        serializer = ser,
+        strategy   = str,
+        encoder    = enc,
+        hmac       = hma,
         data       = opts.data   or {},
         secret     = opts.secret or defaults.secret,
         cookie = {
-            persistent = ifnil(cookie_opts.persistent, cookie_defaults.persistent),
-            discard    = cookie_opts.discard        or cookie_defaults.discard,
-            renew      = cookie_opts.renew          or cookie_defaults.renew,
-            lifetime   = cookie_opts.lifetime       or cookie_defaults.lifetime,
-            path       = cookie_opts.path           or cookie_defaults.path,
-            domain     = cookie_opts.domain         or cookie_defaults.domain,
-            samesite   = cookie_opts.samesite       or cookie_defaults.samesite,
-            secure     = ifnil(cookie_opts.secure,     cookie_defaults.secure),
-            httponly   = ifnil(cookie_opts.httponly,   cookie_defaults.httponly),
-            delimiter  = cookie_opts.delimiter      or cookie_defaults.delimiter,
-            maxsize    = cookie_opts.maxsize        or cookie_defaults.maxsize
+            storage    = ston,
+            encoder    = enc,
+            persistent = ifnil(cookie.persistent, defaults.cookie.persistent),
+            discard    = cookie.discard        or defaults.cookie.discard,
+            renew      = cookie.renew          or defaults.cookie.renew,
+            lifetime   = cookie.lifetime       or defaults.cookie.lifetime,
+            idletime   = cookie.idletime       or defaults.cookie.idletime,
+            path       = cookie.path           or defaults.cookie.path,
+            domain     = cookie.domain         or defaults.cookie.domain,
+            samesite   = cookie.samesite       or defaults.cookie.samesite,
+            secure     = ifnil(cookie.secure,     defaults.cookie.secure),
+            httponly   = ifnil(cookie.httponly,   defaults.cookie.httponly),
+            delimiter  = cookie.delimiter      or defaults.cookie.delimiter,
+            maxsize    = cookie.maxsize        or defaults.cookie.maxsize,
         }, check = {
-            ssi        = ifnil(check_opts.ssi,        check_defaults.ssi),
-            ua         = ifnil(check_opts.ua,         check_defaults.ua),
-            scheme     = ifnil(check_opts.scheme,     check_defaults.scheme),
-            addr       = ifnil(check_opts.addr,       check_defaults.addr)
+            ssi        = ifnil(check.ssi,         defaults.check.ssi),
+            ua         = ifnil(check.ua,          defaults.check.ua),
+            scheme     = ifnil(check.scheme,      defaults.check.scheme),
+            addr       = ifnil(check.addr,        defaults.check.addr)
         }
     }
-    if opts[ident_name]  and not self[ident_name]  then self[ident_name]  = opts[ident_name] end
-    if opts[serial_name] and not self[serial_name] then self[serial_name] = opts[serial_name] end
-    if opts[enc_name]    and not self[enc_name]    then self[enc_name]    = opts[enc_name] end
-    if opts[ciph_name]   and not self[ciph_name]   then self[ciph_name]   = opts[ciph_name] end
-    if opts[stor_name]   and not self[stor_name]   then self[stor_name]   = opts[stor_name] end
-    if opts[strat_name]  and not self[strat_name]  then self[strat_name]  = opts[strat_name] end
-    if opts[hmac_name]   and not self[hmac_name]   then self[hmac_name]   = opts[hmac_name] end
-    self.cipher  = ciph_mod.new(self)
-    self.storage = stor_mod.new(self)
+    if self.cookie.idletime > 0 and self.cookie.discard > self.cookie.idletime then
+        -- if using idletime, then the discard period must be less or equal
+        self.cookie.discard = self.cookie.idletime
+    end
+
+    if not self[iden] then self[iden] = opts[iden] end
+    if not self[sern] then self[sern] = opts[sern] end
+    if not self[encn] then self[encn] = opts[encn] end
+    if not self[cipn] then self[cipn] = opts[cipn] end
+    if not self[ston] then self[ston] = opts[ston] end
+    if not self[strn] then self[strn] = opts[strn] end
+    if not self[hman] then self[hman] = opts[hman] end
+
+    self.cipher  = cip.new(self)
+    self.storage = sto.new(self)
+
     return setmetatable(self, session)
 end
 
@@ -344,9 +493,10 @@ function session.open(opts)
         self.check.scheme and var.scheme          or "",
     }
     self.opened = true
-    local cookie = getcookie(self)
+    local cookie = self:get_cookie()
     if cookie then
-        if self.strategy.open(self, cookie) then
+        cookie = self:parse_cookie()
+        if cookie and self.strategy.open(self, cookie) then
             return self, true
         end
     end
@@ -361,32 +511,44 @@ function session.start(opts)
     if getmetatable(opts) == session and opts.started then
         return opts, opts.present
     end
+
     local self, present = session.open(opts)
-    if present then
-        if self.storage.start then
-            local ok, err = self.storage:start(self.id)
-            if not ok then return nil, err end
+
+    self.started = true
+
+    if not present then
+        return save(self)
+    end
+
+    if self.storage.start then
+        local ok, err = self.storage:start(self.id)
+        if not ok then
+            return nil, err
         end
-        local now = time()
-        if self.expires - now < self.cookie.renew or
-           self.expires > now + self.cookie.lifetime then
-            local ok, err = save(self)
-            if not ok then return nil, err end
+    end
+
+    local now = time()
+    if self.expires - now < self.cookie.renew or
+       self.expires > now + self.cookie.lifetime then
+        local ok, err = save(self)
+        if not ok then
+            return nil, err
         end
     else
-        local ok, err = save(self)
-        if not ok then return nil, err end
+        -- we're not saving, so we must touch to update idletime/usebefore
+        touch(self)
     end
-    self.started = true
+
     return self, present
 end
 
 -- regenerates the session. Generates a new session ID and saves it.
 -- @param self (table) the session object
--- @param flush (boolean) if thruthy the old session will be destroyed, and data deleted
+-- @param flush (boolean) if truthy the old session will be destroyed, and data deleted
 -- @return nothing
 function session:regenerate(flush)
     regenerate(self, flush)
+
     return save(self)
 end
 
@@ -399,6 +561,7 @@ function session:save(close)
     if not self.id then
         self.id = self:identifier()
     end
+
     return save(self, close ~= false)
 end
 
@@ -409,12 +572,14 @@ function session:destroy()
     if self.storage.destroy then
         self.storage:destroy(self.id)
     end
+
     self.data      = {}
     self.present   = nil
     self.opened    = nil
     self.started   = nil
     self.destroyed = true
-    return setcookie(self, "", true)
+
+    return set_cookie(self, "", true)
 end
 
 -- closes the "storage state" (unlocking locks etc)
@@ -426,6 +591,7 @@ function session:close()
     end
 
     self.closed = true
+
     return true
 end
 
@@ -437,6 +603,7 @@ function session:hide()
     if not cookies then
         return
     end
+
     local r = {}
     local n = self.name
     local i = 1
@@ -449,7 +616,7 @@ function session:hide()
             local key = gsub(sub(c, 1, b - 1), "^%s+", "") -- strip leading whitespace
             if key ~= n and key ~= "" then
                 local z = #n
-                if sub(key, z + 1, z + 1) ~= "_" or not tonumber(sub(key, z + 2)) then
+                if sub(key, z + 1, z + 1) ~= "_" or not tonumber(sub(key, z + 2), 10) then
                     j = j + 1
                     r[j] = c
                 end
@@ -458,6 +625,7 @@ function session:hide()
         i = s + 1
         s = find(cookies, ";", i, true)
     end
+
     local c = sub(cookies, i)
     if c and c ~= "" then
         local b = find(c, "=", 1, true)
@@ -465,13 +633,14 @@ function session:hide()
             local key = gsub(sub(c, 1, b - 1), "^%s+", "")
             if key ~= n and key ~= "" then
                 local z = #n
-                if sub(key, z + 1, z + 1) ~= "_" or not tonumber(sub(key, z + 2)) then
+                if sub(key, z + 1, z + 1) ~= "_" or not tonumber(sub(key, z + 2), 10) then
                     j = j + 1
                     r[j] = c
                 end
             end
         end
     end
+
     if j == 0 then
         clear_header("Cookie")
     else

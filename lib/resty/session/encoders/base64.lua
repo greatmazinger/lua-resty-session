@@ -1,6 +1,6 @@
 local ngx       = ngx
-local base64enc = ngx.encode_base64
-local base64dec = ngx.decode_base64
+local encode_base64 = ngx.encode_base64
+local decode_base64 = ngx.decode_base64
 
 local ENCODE_CHARS = {
     ["+"] = "-",
@@ -17,11 +17,11 @@ local DECODE_CHARS = {
 local base64 = {}
 
 function base64.encode(value)
-    return (base64enc(value):gsub("[+/=]", ENCODE_CHARS))
+    return (encode_base64(value):gsub("[+/=]", ENCODE_CHARS))
 end
 
 function base64.decode(value)
-    return base64dec((value:gsub("[-_.]", DECODE_CHARS)))
+    return decode_base64((value:gsub("[-_.]", DECODE_CHARS)))
 end
 
 return base64
